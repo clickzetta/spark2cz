@@ -39,6 +39,8 @@ under the License.
         <CodeCacheSize>128m</CodeCacheSize>
         <spark.doris.version>25.1.0</spark.doris.version>
         <arrow.version>17.0.0</arrow.version>
+        <scala.version>2.12.18</scala.version>
+        <scalatest.version>3.2.17</scalatest.version>
     </properties>
     <dependencies>
         <!-- doris spark -->
@@ -142,6 +144,13 @@ under the License.
             <groupId>log4j</groupId>
             <artifactId>log4j</artifactId>
             <version>1.2.17</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.scalatest</groupId>
+            <artifactId>scalatest_${scala.binary.version}</artifactId>
+            <version>${scalatest.version}</version>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 
