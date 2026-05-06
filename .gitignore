@@ -78,3 +78,5 @@ config.dev.properties
 src/main/resources/config.dev.properties
 logs/
 .bloop/
+test-local.sh
+test-local-doris-sync.sh

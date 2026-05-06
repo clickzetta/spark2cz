@@ -2,15 +2,10 @@ package com.clickzetta.connector
 
 import com.clickzetta.spark.clickzetta.ClickzettaOptions
 import com.clickzetta.spark.clickzetta.ClickzettaOptions.CZ_TABLE
-import org.apache.doris.spark.client.DorisFrontendClient
-import org.apache.doris.spark.config.{DorisConfig, DorisOptions}
-import org.apache.doris.spark.testcase.TestStreamLoadForArrowType.spark.sqlContext
-import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.{DataFrame, SaveMode, SparkSession}
 import org.slf4j.LoggerFactory
 
 import java.sql.DriverManager
-import scala.collection.JavaConverters._
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration.Duration
 import scala.concurrent.{Await, Future}
@@ -85,13 +80,14 @@ object SparkToClickzettaJob {
         val newKey = key.substring(CLICKZETTA_SDK_PREFIX.length)
         newKey -> value
       }
-      .filterKeys(key =>
+      .filter { case (key, _) =>
         key != "format" &&
         key != "enable.results.verify" &&
         key != "enable.concurrent.copy" &&
         key != "save.mode" &&
         key != "enable.bitmap_to_binary"
-      )
+      }
+      .toMap
 
     if (!clickzettaConfigs.contains("writeVersionV2SplitUploadEnabled")) {
       clickzettaConfigs += ("writeVersionV2SplitUploadEnabled" -> "true")
@@ -143,18 +139,6 @@ object SparkToClickzettaJob {
       .getOrCreate()
   }
 
-  private def createDorisConfig(dorisConfigs: Map[String, String], tableName: String, sourceTableKey: String): DorisConfig = {
-    val configMap = (dorisConfigs + (sourceTableKey -> tableName)).asJava
-    DorisConfig.fromMap(sqlContext.sparkContext.getConf.getAll.toMap.asJava, configMap, false)
-  }
-
-  private def getSourceTableSchema(config: DorisConfig): org.apache.doris.spark.rest.models.Schema = {
-    val frontend = new DorisFrontendClient(config)
-    val tableIdentifier = config.getValue(DorisOptions.DORIS_TABLE_IDENTIFIER)
-    val Array(database, table) = tableIdentifier.split("\\.").map(_.replaceAll("`", ""))
-    frontend.getTableSchema(database, table)
-  }
-
   private def createClickzettaTable(
                                      spark: SparkSession,
                                      tableName: String,
@@ -164,7 +148,7 @@ object SparkToClickzettaJob {
     val createTableSql =
       s"""
          |CREATE TABLE IF NOT EXISTS sink_$tableName
-         |USING clickzetta
+         |USING com.clickzetta.spark.clickzetta.v2.ClickzettaDataSourceV2
          |OPTIONS (table '$tableName', $optionsStr)
          |""".stripMargin
 
@@ -266,14 +250,14 @@ object SparkToClickzettaJob {
     spark.sparkContext.setLocalProperty("callSite.short", s"Table: $tbName")
     spark.sparkContext.setLocalProperty("callSite.long", s"Processing table $dbTableName (${order}/${appConfig.sourceTableValues.length})")
 
-    logger.info(s"Transformed Doris configurations: ${appConfig.sourceConfigs.keys.mkString(", ")}")
+    logger.info(s"Transformed source configurations: ${appConfig.sourceConfigs.keys.mkString(", ")}")
+
+    val sourceReader = source.SourceReaderFactory.create(appConfig.sourceFormat)
 
     spark.sparkContext.setLocalProperty("spark.job.description", s"Reading source data from $dbTableName")
-    var sourceDf = spark.read
-      .format(appConfig.sourceFormat)
-      .options(appConfig.sourceConfigs)
-      .option(appConfig.sourceTableKey, dbTableName)
-      .load()
+    var sourceDf = sourceReader.read(spark,
+      appConfig.sourceConfigs + ("__format__" -> appConfig.sourceFormat),
+      appConfig.sourceTableKey, dbTableName)
 
     if (appConfig.sparkFilterQuery.nonEmpty) {
       sourceDf = sourceDf.filter(appConfig.sparkFilterQuery.get)
@@ -296,16 +280,12 @@ object SparkToClickzettaJob {
     spark.sparkContext.setLocalProperty("spark.job.description", s"createOrReplaceTempView for $tbName")
     createClickzettaTable(spark, tbName, appConfig.clickzettaConfigs)
 
-    val dorisConfig = createDorisConfig(appConfig.sourceConfigs, dbTableName, appConfig.sourceTableKey)
-    val sourceTableSchema = getSourceTableSchema(dorisConfig)
-
     // Generate SQL based on SaveMode
     val insertCommand = appConfig.saveMode match {
       case SaveMode.Append => "INSERT INTO"
       case SaveMode.Overwrite => "INSERT OVERWRITE"
       case SaveMode.ErrorIfExists =>
         spark.sparkContext.setLocalProperty("spark.job.description", s"Checking if table sink_$tbName exists (ErrorIfExists mode)")
-        // Check if table exists and has data, throw error if it does
         val existingCount = spark.sql(s"SELECT COUNT(*) FROM sink_$tbName").collect()(0).getLong(0)
         if (existingCount > 0) {
           throw new RuntimeException(s"Table sink_$tbName already exists and contains data. SaveMode is ErrorIfExists.")
@@ -313,7 +293,6 @@ object SparkToClickzettaJob {
         "INSERT INTO"
       case SaveMode.Ignore =>
         spark.sparkContext.setLocalProperty("spark.job.description", s"Checking if table sink_$tbName exists (Ignore mode)")
-        // Check if table exists and has data, skip if it does
         val existingCount = spark.sql(s"SELECT COUNT(*) FROM sink_$tbName").collect()(0).getLong(0)
         if (existingCount > 0) {
           logger.info(s"Table sink_$tbName already exists and contains data. SaveMode is Ignore, skipping...")
@@ -326,33 +305,17 @@ object SparkToClickzettaJob {
         "INSERT INTO"
     }
 
-    import spark.implicits._
     spark.udf.register("bitmapToBytes", (bitmap: String) => {
-      if (bitmap != null) {
-        // Convert string to bytes using UTF-8 encoding
-        bitmap.getBytes("UTF-8")
-      } else {
-        null
-      }
+      if (bitmap != null) bitmap.getBytes("UTF-8") else null
     })
+
+    val selectColumns = sourceReader.buildSelectColumns(sourceDf, appConfig.sourceConfigs,
+      appConfig.sourceTableKey, dbTableName, appConfig.enableBitmapToBinary)
 
     val insertSql =
       s"""
          |$insertCommand sink_$tbName
-         |SELECT
-         |  ${
-        sourceTableSchema.getProperties.asScala.map { field =>
-          if (appConfig.enableBitmapToBinary) {
-            if (field.getType.equalsIgnoreCase("bitmap")) {
-              s"bitmapToBytes(`${field.getName}`) as `${field.getName}`"
-            } else {
-              s"`${field.getName}`"
-            }
-          } else {
-            s"`${field.getName}`"
-          }
-        }.mkString(", ")
-      }
+         |SELECT $selectColumns
          |FROM source_$tbName
          |""".stripMargin
     
@@ -470,24 +433,29 @@ object SparkToClickzettaJob {
       logger.info(s"Processing mode: ${if (appConfig.enableConcurrentCopy) "CONCURRENT" else "SEQUENTIAL"}")
 
       if (appConfig.enableConcurrentCopy) {
-        val results = tableProcessing.par.map { case (dbTableName, index) =>
-          val order = index + 1
-          try {
-            processTable(ss, dbTableName, appConfig, order)
-            logger.info(s"✓ Successfully processed table $dbTableName ($order/${appConfig.sourceTableValues.length})")
-            (dbTableName, true, None)
-          } catch {
-            case ex: Exception =>
-              logger.error(s"✗ Failed to process table $dbTableName ($order/${appConfig.sourceTableValues.length})", ex)
-              (dbTableName, false, Some(ex.getMessage))
-          }
-        }.toArray
-        
-        results.foreach {
-          case (tableName, true, _) => successTables.synchronized { successTables += tableName }
-          case (tableName, false, Some(errorMsg)) => failedTables.synchronized { failedTables += ((tableName, errorMsg)) }
-          case (tableName, false, None) => failedTables.synchronized { failedTables += ((tableName, "Unknown error")) }
+        import java.util.concurrent.{Executors, CountDownLatch}
+        val pool = Executors.newFixedThreadPool(Math.min(tableProcessing.length, 10))
+        val latch = new CountDownLatch(tableProcessing.length)
+        tableProcessing.foreach { case (dbTableName, index) =>
+          pool.submit(new Runnable {
+            override def run(): Unit = {
+              val order = index + 1
+              try {
+                processTable(ss, dbTableName, appConfig, order)
+                logger.info(s"✓ Successfully processed table $dbTableName ($order/${appConfig.sourceTableValues.length})")
+                successTables.synchronized { successTables += dbTableName }
+              } catch {
+                case ex: Exception =>
+                  logger.error(s"✗ Failed to process table $dbTableName ($order/${appConfig.sourceTableValues.length})", ex)
+                  failedTables.synchronized { failedTables += ((dbTableName, ex.getMessage)) }
+              } finally {
+                latch.countDown()
+              }
+            }
+          })
         }
+        latch.await()
+        pool.shutdown()
       } else {
         tableProcessing.foreach { case (dbTableName, index) =>
           val order = index + 1
