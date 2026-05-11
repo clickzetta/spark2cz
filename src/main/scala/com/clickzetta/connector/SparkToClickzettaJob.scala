@@ -2,13 +2,19 @@ package com.clickzetta.connector
 
 import com.clickzetta.spark.clickzetta.ClickzettaOptions
 import com.clickzetta.spark.clickzetta.ClickzettaOptions.CZ_TABLE
+import org.apache.spark.sql.execution.datasources.DataSource
+import org.apache.spark.sql.sources.DataSourceRegister
 import org.apache.spark.sql.{DataFrame, SaveMode, SparkSession}
 import org.slf4j.LoggerFactory
 
+import java.net.URL
 import java.sql.DriverManager
+import java.util.ServiceLoader
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration.Duration
 import scala.concurrent.{Await, Future}
+import scala.collection.JavaConverters._
+import scala.io.Source
 import scala.util.{Failure, Success, Try}
 
 // Spark Submit Examples (all configs must have spark. prefix):
@@ -31,11 +37,13 @@ import scala.util.{Failure, Success, Try}
 //   spark2cz-1.0-SNAPSHOT.jar
 object SparkToClickzettaJob {
   private val logger = LoggerFactory.getLogger(this.getClass)
+  private val DataSourceRegisterServiceFile = "META-INF/services/org.apache.spark.sql.sources.DataSourceRegister"
 
   // Configuration keys (all with spark. prefix to avoid being filtered out by Spark)
   private val SOURCE_FORMAT_KEY = "spark.source.format"
   private val SOURCE_TABLE_KEY_KEY = "spark.source.table.key"
   private val SOURCE_TABLE_VALUES_KEY = "spark.source.table.values"
+  private val SOURCE_TABLE_NAME_KEY = "spark.source.table.name"  // 可选: 显式指定目标表名, 优先于从路径推断
   private val CZ_SCHEMA_KEY = "spark.clickzetta.sdk.schema"
   private val CZ_ENABLE_RESULTS_VERIFY_KEY = "spark.clickzetta.sdk.enable.results.verify"
   private val CZ_ENABLE_CONCURRENT_COPY_KEY = "spark.clickzetta.sdk.enable.concurrent.copy"
@@ -58,7 +66,8 @@ object SparkToClickzettaJob {
                                 enableConcurrentCopy: Boolean = false,
                                 saveMode: SaveMode = SaveMode.Overwrite,
                                 enableBitmapToBinary: Boolean = false,
-                                sparkFilterQuery: Option[String] = None
+                                sparkFilterQuery: Option[String] = None,
+                                sourceTableName: Option[String] = None  // 显式目标表名, 优先于从路径推断
                               )
 
   private def parseAppConfig(spark: SparkSession): AppConfig = {
@@ -129,7 +138,8 @@ object SparkToClickzettaJob {
       enableConcurrentCopy = conf.getOption(CZ_ENABLE_CONCURRENT_COPY_KEY).exists(_.toBoolean),
       saveMode = saveMode,
       enableBitmapToBinary = if (conf.getOption(CZ_ENABLE_BITMAP_CAST_KEY).isEmpty) true else conf.getOption(CZ_ENABLE_BITMAP_CAST_KEY).exists(_.toBoolean),
-      sparkFilterQuery = sparkFilterQuery
+      sparkFilterQuery = sparkFilterQuery,
+      sourceTableName = conf.getOption(SOURCE_TABLE_NAME_KEY).filter(_.nonEmpty)
     )
   }
 
@@ -148,12 +158,19 @@ object SparkToClickzettaJob {
     val createTableSql =
       s"""
          |CREATE TABLE IF NOT EXISTS sink_$tableName
-         |USING com.clickzetta.spark.clickzetta.v2.ClickzettaDataSourceV2
+         |USING clickzetta
          |OPTIONS (table '$tableName', $optionsStr)
          |""".stripMargin
 
     logger.info(s"Creating Clickzetta table: $createTableSql")
-    spark.sql(createTableSql)
+    try {
+      spark.sql(createTableSql)
+      logger.info(s"Clickzetta table sink_$tableName created successfully")
+    } catch {
+      case e: Exception =>
+        logger.error(s"Failed to create Clickzetta table sink_$tableName. SQL:\n$createTableSql", e)
+        throw e
+    }
   }
 
   private def verifyResults(
@@ -238,7 +255,14 @@ object SparkToClickzettaJob {
     logger.info(s"Processing the $order-th table: $dbTableName")
 
     val jobGroup = s"table-$order-${dbTableName.replace(".", "_")}"
-    val tbName = dbTableName.split("\\.").last
+    val tbName = appConfig.sourceTableName.getOrElse {
+      if (dbTableName.contains("://")) {
+        // abfss://... 路径格式: 取最后一段目录名
+        dbTableName.stripSuffix("/").split("/").last.replaceAll("[^a-zA-Z0-9_]", "_")
+      } else {
+        dbTableName.split("\\.").last
+      }
+    }
     
     spark.sparkContext.setJobGroup(
       jobGroup,
@@ -416,12 +440,176 @@ object SparkToClickzettaJob {
     logger.info("=" * 80)
   }
 
+  private def getCodeSourceLocation(clazz: Class[_]): String = {
+    Option(clazz)
+      .flatMap(c => Option(c.getProtectionDomain))
+      .flatMap(pd => Option(pd.getCodeSource))
+      .flatMap(cs => Option(cs.getLocation))
+      .map(_.toString)
+      .getOrElse("unknown")
+  }
+
+  private def logClassAvailability(className: String): Unit = {
+    try {
+      val clazz = Class.forName(className)
+      logger.info(
+        s"[DataSourceClass] loaded class=$className, codeSource=${getCodeSourceLocation(clazz)}"
+      )
+    } catch {
+      case e: Throwable =>
+        logger.error(s"[DataSourceClass] failed to load class=$className", e)
+    }
+  }
+
+  private def readServiceResourceLines(resourceUrl: URL): Seq[String] = {
+    val resource = Source.fromURL(resourceUrl, "UTF-8")
+    try {
+      resource.getLines().map(_.trim).filter(line => line.nonEmpty && !line.startsWith("#")).toVector
+    } finally {
+      resource.close()
+    }
+  }
+
+  private def logDataSourceRegisterResources(label: String, classLoader: ClassLoader): Unit = {
+    if (classLoader == null) {
+      logger.warn(s"[DataSourceService][$label] classLoader is null")
+      return
+    }
+
+    logger.info(s"[DataSourceService][$label] classLoader=$classLoader")
+    val resources = Try(classLoader.getResources(DataSourceRegisterServiceFile).asScala.toSeq).getOrElse(Seq.empty)
+
+    if (resources.isEmpty) {
+      logger.warn(s"[DataSourceService][$label] no resource found for $DataSourceRegisterServiceFile")
+      return
+    }
+
+    resources.zipWithIndex.foreach { case (resourceUrl, resourceIndex) =>
+      logger.info(s"[DataSourceService][$label][$resourceIndex] resource=$resourceUrl")
+      Try(readServiceResourceLines(resourceUrl)) match {
+        case Success(lines) if lines.nonEmpty =>
+          lines.zipWithIndex.foreach { case (line, lineIndex) =>
+            logger.info(s"[DataSourceService][$label][$resourceIndex][$lineIndex] provider=$line")
+          }
+        case Success(_) =>
+          logger.warn(s"[DataSourceService][$label][$resourceIndex] resource is empty after filtering comments")
+        case Failure(ex) =>
+          logger.error(s"[DataSourceService][$label][$resourceIndex] failed to read resource=$resourceUrl", ex)
+      }
+    }
+  }
+
+  private def logDiscoveredDataSourceRegisters(label: String, classLoader: ClassLoader): Unit = {
+    if (classLoader == null) {
+      logger.warn(s"[DataSourceRegister][$label] classLoader is null")
+      return
+    }
+
+    val loader = ServiceLoader.load(classOf[DataSourceRegister], classLoader)
+    val iterator = loader.iterator()
+    var discovered = 0
+
+    while ({
+      Try(iterator.hasNext) match {
+        case Success(hasNext) => hasNext
+        case Failure(ex) =>
+          logger.error(s"[DataSourceRegister][$label] failed while iterating providers", ex)
+          false
+      }
+    }) {
+      Try(iterator.next()) match {
+        case Success(provider) =>
+          discovered += 1
+          logger.info(
+            s"[DataSourceRegister][$label][$discovered] shortName=${provider.shortName()}, " +
+              s"className=${provider.getClass.getName}, codeSource=${getCodeSourceLocation(provider.getClass)}"
+          )
+        case Failure(ex) =>
+          logger.error(s"[DataSourceRegister][$label] failed to instantiate provider", ex)
+      }
+    }
+
+    if (discovered == 0) {
+      logger.warn(s"[DataSourceRegister][$label] no provider discovered via ServiceLoader")
+    }
+  }
+
+  private def logSparkDataSourceLookup(spark: SparkSession, provider: String): Unit = {
+    try {
+      val resolvedClass = DataSource.lookupDataSource(provider, spark.sessionState.conf)
+      logger.info(
+        s"[DataSourceLookup] provider=$provider, resolvedClass=${resolvedClass.getName}, " +
+          s"codeSource=${getCodeSourceLocation(resolvedClass)}"
+      )
+    } catch {
+      case e: Throwable =>
+        logger.error(s"[DataSourceLookup] failed to resolve provider=$provider", e)
+    }
+
+    try {
+      DataSource.lookupDataSourceV2(provider, spark.sessionState.conf) match {
+        case Some(tableProvider) =>
+          val providerClass = tableProvider.getClass
+          logger.info(
+            s"[DataSourceLookupV2] provider=$provider, resolvedClass=${providerClass.getName}, " +
+              s"codeSource=${getCodeSourceLocation(providerClass)}"
+          )
+        case None =>
+          logger.warn(s"[DataSourceLookupV2] provider=$provider resolved to None")
+      }
+    } catch {
+      case e: Throwable =>
+        logger.error(s"[DataSourceLookupV2] failed to resolve provider=$provider", e)
+    }
+  }
+
+  private def logDataSourceDiagnostics(spark: SparkSession, appConfig: AppConfig): Unit = {
+    try {
+      val threadContextClassLoader = Thread.currentThread().getContextClassLoader
+      val jobClassLoader = getClass.getClassLoader
+
+      logger.info(s"[DataSourceDiag] threadContextClassLoader=$threadContextClassLoader")
+      logger.info(s"[DataSourceDiag] jobClassLoader=$jobClassLoader")
+
+      logDataSourceRegisterResources("thread-context", threadContextClassLoader)
+      if (jobClassLoader ne threadContextClassLoader) {
+        logDataSourceRegisterResources("job-class", jobClassLoader)
+      }
+
+      logDiscoveredDataSourceRegisters("thread-context", threadContextClassLoader)
+      if (jobClassLoader ne threadContextClassLoader) {
+        logDiscoveredDataSourceRegisters("job-class", jobClassLoader)
+      }
+
+      Seq(
+        "com.clickzetta.spark.clickzetta.v2.ClickzettaDataSourceV2",
+        "com.clickzetta.spark.clickzetta.ClickzettaRelationProvider",
+        "org.apache.spark.sql.delta.sources.DeltaDataSource",
+        "org.apache.doris.spark.sql.sources.DorisDataSource"
+      ).foreach(logClassAvailability)
+
+      Seq(
+        "clickzetta",
+        "delta",
+        appConfig.sourceFormat,
+        "com.clickzetta.spark.clickzetta.v2.ClickzettaDataSourceV2",
+        "com.clickzetta.spark.clickzetta.ClickzettaRelationProvider",
+        "org.apache.spark.sql.delta.sources.DeltaDataSource",
+        "org.apache.doris.spark.sql.sources.DorisDataSource"
+      ).distinct.foreach(provider => logSparkDataSourceLookup(spark, provider))
+    } catch {
+      case e: Throwable =>
+        logger.error("[DataSourceDiag] diagnostics failed, but job startup will continue", e)
+    }
+  }
+
   def main(args: Array[String]): Unit = {
     val ss = createSparkSession()
     val appConfig = parseAppConfig(ss)
 
     // Print formatted startup information
     printStartupInfo(ss, appConfig)
+    logDataSourceDiagnostics(ss, appConfig)
 
     try {
       val tableProcessing = appConfig.sourceTableValues.zipWithIndex
