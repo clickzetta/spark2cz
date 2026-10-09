@@ -50,6 +50,7 @@ object SparkToClickzettaJob {
   private val CZ_SAVE_MODE_KEY = "spark.clickzetta.sdk.save.mode"
   private val CZ_ENABLE_BITMAP_CAST_KEY = "spark.clickzetta.sdk.enable.bitmap_to_binary"
   private val SPARK_FILTER_QUERY_KEY = "spark.filter.query"
+  private val TARGET_PARTITION_FILTER_KEY = "spark.target.partition.filter"
 
   // Configuration prefixes (all with spark. prefix to avoid being filtered out by Spark)
   private val SOURCE_CONNECTOR_PREFIX = "spark.source.connector."
@@ -67,6 +68,7 @@ object SparkToClickzettaJob {
                                 saveMode: SaveMode = SaveMode.Overwrite,
                                 enableBitmapToBinary: Boolean = false,
                                 sparkFilterQuery: Option[String] = None,
+                                targetPartitionFilter: Option[String] = None,
                                 sourceTableName: Option[String] = None  // 显式目标表名, 优先于从路径推断
                               )
 
@@ -97,10 +99,6 @@ object SparkToClickzettaJob {
         key != "enable.bitmap_to_binary"
       }
       .toMap
-
-    if (!clickzettaConfigs.contains("writeVersionV2SplitUploadEnabled")) {
-      clickzettaConfigs += ("writeVersionV2SplitUploadEnabled" -> "true")
-    }
 
     // Parse save mode
     val saveModeStr = conf.getOption(CZ_SAVE_MODE_KEY).getOrElse("overwrite")
@@ -139,6 +137,7 @@ object SparkToClickzettaJob {
       saveMode = saveMode,
       enableBitmapToBinary = if (conf.getOption(CZ_ENABLE_BITMAP_CAST_KEY).isEmpty) true else conf.getOption(CZ_ENABLE_BITMAP_CAST_KEY).exists(_.toBoolean),
       sparkFilterQuery = sparkFilterQuery,
+      targetPartitionFilter = conf.getOption(TARGET_PARTITION_FILTER_KEY).filter(_.trim.nonEmpty),
       sourceTableName = conf.getOption(SOURCE_TABLE_NAME_KEY).filter(_.nonEmpty)
     )
   }
@@ -167,6 +166,23 @@ object SparkToClickzettaJob {
       spark.sql(createTableSql)
       logger.info(s"Clickzetta table sink_$tableName created successfully")
     } catch {
+      case e: Exception if e.getMessage != null && e.getMessage.contains("table or view not found") =>
+        // Clickzetta connector resolveTable fails when table doesn't exist yet, retry with CREATE TABLE (no IF NOT EXISTS)
+        logger.warn(s"Table not found during CREATE TABLE IF NOT EXISTS (expected for new tables), retrying with CREATE TABLE...")
+        val retrySql =
+          s"""
+             |CREATE TABLE sink_$tableName
+             |USING clickzetta
+             |OPTIONS (table '$tableName', $optionsStr)
+             |""".stripMargin
+        try {
+          spark.sql(retrySql)
+          logger.info(s"Clickzetta table sink_$tableName created successfully (retry)")
+        } catch {
+          case e2: Exception =>
+            logger.error(s"Failed to create Clickzetta table sink_$tableName on retry. SQL:\n$retrySql", e2)
+            throw e2
+        }
       case e: Exception =>
         logger.error(s"Failed to create Clickzetta table sink_$tableName. SQL:\n$createTableSql", e)
         throw e
@@ -288,6 +304,9 @@ object SparkToClickzettaJob {
     }
 
     if (sourceDf.isEmpty) {
+      appConfig.targetPartitionFilter.foreach { predicate =>
+        deleteTargetPartition(appConfig, tbName, predicate)
+      }
       logger.warn(s"Table $dbTableName is empty, skipping...")
       spark.sparkContext.clearJobGroup()
       spark.sparkContext.setLocalProperty("spark.job.description", null)
@@ -305,7 +324,9 @@ object SparkToClickzettaJob {
     createClickzettaTable(spark, tbName, appConfig.clickzettaConfigs)
 
     // Generate SQL based on SaveMode
-    val insertCommand = appConfig.saveMode match {
+    val insertCommand = if (appConfig.targetPartitionFilter.nonEmpty) {
+      "INSERT OVERWRITE"
+    } else appConfig.saveMode match {
       case SaveMode.Append => "INSERT INTO"
       case SaveMode.Overwrite => "INSERT OVERWRITE"
       case SaveMode.ErrorIfExists =>
@@ -383,6 +404,25 @@ object SparkToClickzettaJob {
     spark.sparkContext.setLocalProperty("callSite.long", null)
   }
 
+  private def deleteTargetPartition(appConfig: AppConfig, tableName: String, predicate: String): Unit = {
+    val options = new ClickzettaOptions(appConfig.clickzettaConfigs + (CZ_TABLE -> tableName))
+    val qualifiedTable = s"`${appConfig.czSchema.replace("`", "``")}`.`${tableName.replace("`", "``")}`"
+    val deleteSql = s"DELETE FROM $qualifiedTable WHERE $predicate"
+    logger.info(s"Replacing target partition scope for $tableName with predicate: $predicate")
+
+    var connection: java.sql.Connection = null
+    var statement: java.sql.Statement = null
+    try {
+      Class.forName("com.clickzetta.client.jdbc.ClickZettaDriver")
+      connection = DriverManager.getConnection(options.url)
+      statement = connection.createStatement()
+      statement.execute(deleteSql)
+    } finally {
+      if (statement != null) try statement.close() catch { case _: Exception => () }
+      if (connection != null) try connection.close() catch { case _: Exception => () }
+    }
+  }
+
   private def printStartupInfo(spark: SparkSession, appConfig: AppConfig): Unit = {
     logger.info("=" * 80)
     logger.info("                    Spark to Clickzetta Job Started")
@@ -434,7 +474,10 @@ object SparkToClickzettaJob {
     spark.conf.getAll
       .filter(_._1.startsWith("spark."))
       .toSeq.sortBy(_._1).foreach { case (key, value) =>
-        logger.info(f"  $key%-30s : $value")
+        val lowerKey = key.toLowerCase
+        val displayValue = if (Seq("password", "secret", "token", "access.key", "private.key")
+          .exists(lowerKey.contains)) "***" else value
+        logger.info(f"  $key%-30s : $displayValue")
       }
 
     logger.info("=" * 80)
@@ -581,21 +624,23 @@ object SparkToClickzettaJob {
         logDiscoveredDataSourceRegisters("job-class", jobClassLoader)
       }
 
-      Seq(
+      val configuredProviderClass = Option(appConfig.sourceFormat)
+        .map(_.trim)
+        .filter(_.contains("."))
+
+      (Seq(
         "com.clickzetta.spark.clickzetta.v2.ClickzettaDataSourceV2",
         "com.clickzetta.spark.clickzetta.ClickzettaRelationProvider",
-        "org.apache.spark.sql.delta.sources.DeltaDataSource",
-        "org.apache.doris.spark.sql.sources.DorisDataSource"
-      ).foreach(logClassAvailability)
+        "org.apache.spark.sql.delta.sources.DeltaDataSource"
+      ) ++ configuredProviderClass).distinct.foreach(logClassAvailability)
 
       Seq(
         "clickzetta",
         "delta",
-        appConfig.sourceFormat,
+        appConfig.sourceFormat.trim,
         "com.clickzetta.spark.clickzetta.v2.ClickzettaDataSourceV2",
         "com.clickzetta.spark.clickzetta.ClickzettaRelationProvider",
-        "org.apache.spark.sql.delta.sources.DeltaDataSource",
-        "org.apache.doris.spark.sql.sources.DorisDataSource"
+        "org.apache.spark.sql.delta.sources.DeltaDataSource"
       ).distinct.foreach(provider => logSparkDataSourceLookup(spark, provider))
     } catch {
       case e: Throwable =>

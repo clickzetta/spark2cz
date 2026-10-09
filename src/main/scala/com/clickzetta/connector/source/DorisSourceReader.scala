@@ -5,6 +5,16 @@ import org.slf4j.LoggerFactory
 
 import scala.collection.JavaConverters._
 
+/**
+ *
+ 配置                                                 作用
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ spark.source.connector.doris.read.bitmap-to-string=true  让 Doris Connector 以字符串形式读取 bitmap
+ ───────────────────────────────────────────────────  ──────────────────────────────────────────────────────────────────
+ spark.clickzetta.sdk.enable.bitmap_to_binary=true    为 bitmap 字段启用 Spark Binary 中间承载和后续类型匹配
+ ───────────────────────────────────────────────────  ──────────────────────────────────────────────────────────────────
+ cz.bitmap.type.enable=true                           ClickZetta Row/Arrow 写入链路默认启用 ClickZetta bitmap 类型标记
+ */
 class DorisSourceReader extends SourceReader {
   private val logger = LoggerFactory.getLogger(classOf[DorisSourceReader])
 

@@ -2,6 +2,32 @@
 
 本文档介绍了 SparkToClickzettaJob 的所有配置参数，这些参数现在通过 `spark-submit` 的 `--conf` 选项传递。
 
+## CMT Hive 导出入口
+
+`com.clickzetta.connector.SourceExportJob` 是供 CMT Hive Spark 任务使用的 staging 导出入口。它通过
+`SourceReaderFactory` 选择读取实现，目前 CMT 使用 `hive` reader，并固定以 Parquet overwrite 方式写入
+任务级 `file://` 或 `cosn://` 目录。固定格式和写入模式是后续 CMT COPY 阶段的协议，不提供可覆盖参数。
+
+| 参数名 | 类型 | 必填 | 说明 |
+|--------|------|------|------|
+| `spark.spark2cz.source.type` | String | 是 | 源类型；Hive 任务使用 `hive` |
+| `spark.spark2cz.source.table` | String | 是 | Hive 表名，如 `` `sales`.`orders` `` |
+| `spark.spark2cz.source.filter` | String | 否 | Spark SQL 过滤表达式 |
+| `spark.spark2cz.export.path` | String | 是 | 任务级导出目录，支持 `file://` 或运行时已配置的对象存储 URI |
+
+```bash
+spark-submit \
+  --class com.clickzetta.connector.SourceExportJob \
+  --conf spark.spark2cz.source.type=hive \
+  --conf 'spark.spark2cz.source.table=`sales`.`orders`' \
+  --conf spark.spark2cz.export.path=file:///tmp/cmt/hive/job-1/task-1 \
+  <spark2cz-shaded.jar>
+```
+
+COS/HDFS/Hive Metastore 的认证和连接参数属于 Spark/Hadoop 运行时配置，不属于上述应用参数。优先使用
+集群角色或 Hadoop credential provider；使用静态凭证时应配置 Spark 的 redaction 规则，且不要把凭证放进
+`spark.spark2cz.*` 参数。
+
 ## 使用方式
 
 现在使用 `spark-submit` 命令运行作业，所有配置通过 `--conf` 参数传递：
@@ -49,6 +75,40 @@ spark-submit --class com.clickzetta.connector.SparkToClickzettaJob \
 | `source.connector.doris.request.tablet.size` | Integer | 否 | 10 | Tablet 大小 |
 | `source.connector.doris.read.bitmap-to-string` | Boolean | 否 | true | 是否将 bitmap 类型读取为字符串 |
 
+#### StarRocks 3.5 连接器配置
+
+StarRocks 使用 `com.starrocks:starrocks-spark-connector-3.5_2.12:1.1.4`，与 Doris
+连接器共存于同一个 shaded JAR。配置会去掉 `source.connector.` 前缀后原样传递给
+StarRocks connector；因此这里的 key 使用 connector 文档中的 `starrocks.*` 名称。
+
+| 参数名 | 类型 | 必填 | 默认值 | 说明 |
+|--------|------|------|--------|------|
+| `source.connector.starrocks.fe.http.url` | String | 是 | - | FE HTTP 地址，如 `http://host:8030` |
+| `source.connector.starrocks.fe.jdbc.url` | String | 是 | - | FE MySQL/JDBC 地址，如 `jdbc:mysql://host:9030` |
+| `source.connector.starrocks.user` | String | 是 | - | StarRocks 用户名 |
+| `source.connector.starrocks.password` | String | 是 | - | StarRocks 密码 |
+| `source.connector.starrocks.table.identifier` | String | 是 | - | 源表标识，如 `db.table` |
+| `source.connector.starrocks.column.types` | String | 否 | - | 使用 Spark DDL 覆盖列类型；复杂类型需显式指定 |
+| `source.connector.starrocks.bitmap.columns` | String | 否 | - | CMT 内部列清单；存在 Bitmap 列时自动切换公开 RDD 读取路径 |
+| `source.connector.starrocks.filter.query` | String | 否 | - | StarRocks connector 过滤条件 |
+| `source.connector.starrocks.request.retries` | Integer | 否 | 3 | HTTP 请求重试次数 |
+| `source.connector.starrocks.request.connect.timeout.ms` | Integer | 否 | 30000 | HTTP 连接超时（毫秒） |
+| `source.connector.starrocks.request.read.timeout.ms` | Integer | 否 | 30000 | HTTP 读取超时（毫秒） |
+| `source.connector.starrocks.request.query.timeout.s` | Integer | 否 | 3600 | 查询超时（秒）；`-1` 表示不限制 |
+| `source.connector.starrocks.request.tablet.size` | Integer | 否 | Integer.MAX_VALUE | 每个 Spark 分区包含的 tablet 数 |
+| `source.connector.starrocks.batch.size` | Integer | 否 | 4096 | 每次从 BE 读取的行数；StarRocks 2.2+ 最小按 4096 处理 |
+| `source.connector.starrocks.exec.mem.limit` | Long | 否 | 2147483648 | 单查询内存上限（字节） |
+| `source.connector.starrocks.deserialize.arrow.async` | Boolean | 否 | false | 是否异步转换 Arrow 数据 |
+| `source.connector.starrocks.deserialize.queue.size` | Integer | 否 | 64 | 异步 Arrow 转换队列大小 |
+| `source.connector.starrocks.timezone` | String | 否 | Asia/Shanghai | DATETIME 转 Spark Timestamp 使用的时区 |
+
+`starrocks` 是 Spark provider 短名；也可以在 `source.format` 中填写
+`com.starrocks.connector.spark.sql.StarRocksDataSourceProvider`。当前 profile 固定
+支持 StarRocks 3.5 connector 1.1.4。该版本没有 Doris 的
+`read.bitmap-to-string` 开关。当前实现检测到 `BITMAP` 列后，使用 connector 公开 RDD API
+在 FE 查询中执行 `bitmap_to_string`，再复用 Spark Binary/ClickZetta Bitmap 写入链路；
+`HLL` 仍保持失败。
+
 ### 3. Clickzetta SDK 配置
 
 这些配置会自动去掉 `clickzetta.sdk.` 前缀后传递给 Clickzetta SDK。
@@ -74,6 +134,8 @@ spark-submit --class com.clickzetta.connector.SparkToClickzettaJob \
 | `clickzetta.sdk.cz.bulkload.file.purge.enable` | Boolean | 否 | false | 是否启用文件清理 |
 | `clickzetta.sdk.cz.bulkload.merge.into.table.volume.cleanup.enable` | Boolean | 否 | false | 是否启用表卷清理 |
 | `clickzetta.sdk.cz.bulkload.local.file.cleanup.enable` | Boolean | 否 | false | 是否启用本地文件清理 |
+| `clickzetta.sdk.writeVersion` | String | 否 | `V2` | 写入实现版本；如需规避 V2 路径可显式设为 `V1` |
+| `clickzetta.sdk.writeVersionV2SplitUploadEnabled` | Boolean | 否 | false | 是否开启 V2 split upload，建议仅在明确验证后手动开启 |
 | `cz.bulkload.sql.table.sink.supports.eq` | Boolean | 否 | true | SQL 表 sink 是否支持相等操作 |
 | `clickzetta.sdk.spark.cz.bulkload.sql.cz.sql.table.sink.supports.eq` | Boolean | 否 | false | Spark Clickzetta SQL 表 sink 相等操作支持 |
 
@@ -82,6 +144,7 @@ spark-submit --class com.clickzetta.connector.SparkToClickzettaJob \
 | 参数名 | 类型 | 必填 | 默认值 | 说明 |
 |--------|------|------|--------|------|
 | `spark.filter.query` | String | 否 | - | Spark SQL 过滤条件，如：`dt between '2022-01-01' and '2022-12-31'` |
+| `spark.target.partition.filter` | String | 否 | - | CMT 内部使用；存在时源数据已按该条件过滤，并使用 Lakehouse 动态 `INSERT OVERWRITE` 仅覆盖输入命中的分区；空结果才执行范围删除 |
 
 ### 5. Spark 运行时配置
 
