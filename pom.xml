@@ -28,6 +28,7 @@
         <jackson.version>2.15.2</jackson.version>
         <doris.connector.scope>compile</doris.connector.scope>
         <spark.scope>provided</spark.scope>
+        <netty.version>4.1.136.Final</netty.version>
     </properties>
 
     <profiles>
@@ -105,13 +106,44 @@
         </profile>
     </profiles>
 
+    <!-- 统一所有 netty 模块版本（含传递依赖），修复 netty-codec-xml/codec-http/resolver-dns 等 CVE -->
+    <dependencyManagement>
     <dependencies>
+            <dependency>
+                <groupId>io.netty</groupId>
+                <artifactId>netty-bom</artifactId>
+                <version>${netty.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!--netty -->
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-common</artifactId>
+            <version>${netty.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-all</artifactId>
+            <version>${netty.version}</version>
+        </dependency>
         <!-- Spark -->
         <dependency>
             <groupId>org.apache.spark</groupId>
             <artifactId>spark-core_${scala.binary.version}</artifactId>
             <version>${spark.version}</version>
             <scope>${spark.scope}</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>io.netty</groupId>
+                    <artifactId>netty-all</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
         <dependency>
             <groupId>org.apache.spark</groupId>
@@ -179,6 +211,16 @@
             <groupId>org.apache.arrow</groupId>
             <artifactId>flight-sql-jdbc-core</artifactId>
             <version>${arrow.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>io.netty</groupId>
+                    <artifactId>netty-common</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>io.netty</groupId>
+                    <artifactId>netty-all</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <!-- Clickzetta Spark connector -->
